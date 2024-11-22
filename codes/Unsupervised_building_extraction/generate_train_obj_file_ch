@@ -1,0 +1,96 @@
+import os
+
+def generate_file(root, target_path):
+    b_list = []
+    nb_list = []
+
+    save_building_path = "{}/{}.txt".format(target_path, 'building')
+    save_none_building_path = "{}/{}.txt".format(target_path, 'none_building')
+
+    # b1_path = root + '\\building_ins_b'
+    # b2_path = root + '\\cross_building_ins_b'
+    # nb1_path = root + '\\none_building_ins_nb'
+    # nb2_path = root + '\\cross_none_building_ins_nb'
+
+    b1_path = root + '\\building_ins'
+    b2_path = root + '\\cross_building_ins'
+    nb1_path = root + '\\none_building_ins'
+    nb2_path = root + '\\cross_none_building_ins'
+
+    b1_list = os.listdir(b1_path)
+    b2_list = os.listdir(b2_path)
+
+    nb1_list = os.listdir(nb1_path)
+    nb2_list = os.listdir(nb2_path)
+
+    print('len of b1_list: ', len(b1_list))
+    print('len of b2_list: ', len(b2_list))
+    print('len of nb1_list: ', len(nb1_list))
+    print('len of nb2_list: ', len(nb2_list))
+
+    for n in b1_list:
+        b = os.path.join(os.path.abspath(b1_path), n)
+        b_list.append(b)
+    for n in b2_list:
+        b = os.path.join(os.path.abspath(b2_path), n)
+        b_list.append(b)
+
+    for n in nb1_list:
+        nb = os.path.join(os.path.abspath(nb1_path), n)
+        nb_list.append(nb)
+    for n in nb2_list:
+        nb = os.path.join(os.path.abspath(nb2_path), n)
+        nb_list.append(nb)
+
+    with open(save_building_path, "w") as f:
+        for name in b_list:
+            f.write(name + "\n")
+
+    with open(save_none_building_path, "w") as f:
+        for name in nb_list:
+            f.write(name + "\n")
+
+def generate_file_all(root, target_path):
+    b_list = []
+    nb_list = []
+
+    save_building_path = "{}/{}.txt".format(target_path, 'building_all')
+    save_none_building_path = "{}/{}.txt".format(target_path, 'none_building_all')
+
+    b1_path = root + '\\building_ins'
+    b2_path = root + '\\cross_building_ins'
+    nb1_path = root + '\\none_building_ins'
+    nb2_path = root + '\\cross_none_building_ins'
+
+    b1_list = os.listdir(b1_path)
+    b2_list = os.listdir(b2_path)
+
+    nb1_list = os.listdir(nb1_path)
+    nb2_list = os.listdir(nb2_path)
+
+    print('len of b1_list: ', len(b1_list))
+    print('len of b2_list: ', len(b2_list))
+    print('len of nb1_list: ', len(nb1_list))
+    print('len of nb2_list: ', len(nb2_list))
+
+    for n in b1_list:
+        b = os.path.join(os.path.abspath(b1_path), n)
+        b_list.append(b)
+    for n in b2_list:
+        b = os.path.join(os.path.abspath(b2_path), n)
+        b_list.append(b)
+
+    for n in nb1_list:
+        nb = os.path.join(os.path.abspath(nb1_path), n)
+        nb_list.append(nb)
+    for n in nb2_list:
+        nb = os.path.join(os.path.abspath(nb2_path), n)
+        nb_list.append(nb)
+
+    with open(save_building_path, "w") as f:
+        for name in b_list:
+            f.write(name + "\n")
+
+    with open(save_none_building_path, "w") as f:
+        for name in nb_list:
+            f.write(name + "\n")
