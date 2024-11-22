@@ -1,0 +1,235 @@
+import sys
+sys.path.append('..')
+from PIL import Image
+from . import CDdataset as CDdataset
+import numpy as np
+from torchvision.models import resnet50, ResNet50_Weights
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from utils.metrics import Evaluator
+import random
+from CLIP import clip
+
+seed = 1
+np.random.seed(seed)
+random.seed(seed)
+torch.manual_seed(seed)  # cpu
+torch.cuda.manual_seed_all(seed)  # 并行gpu
+torch.backends.cudnn.deterministic = True  # cpu/gpu结果一致
+torch.backends.cudnn.benchmark = False  # 训练集变化不大时使训练加速
+import os
+os.environ['PYTHONHASHSEED'] = str(seed)
+
+class MyModel(nn.Module):
+    def __init__(self, ):
+        super(MyModel, self).__init__()
+        self.model_resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        num_ftrs = self.model_resnet.fc.in_features
+        self.model_resnet.fc = nn.Identity()
+        self.fc1 = nn.Linear(num_ftrs, 512)
+        self.fc2 = nn.Linear(512, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.model_resnet(x)
+        out1 = self.fc1(x)
+        out2 = self.fc2(out1)
+        out3 = self.sigmoid(out2)
+        return out3
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, ratio = 8):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels,in_channels//ratio,1,bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_channels//ratio, in_channels,1,bias=False)
+        self.sigmod = nn.Sigmoid()
+    def forward(self,x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmod(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super(SpatialAttention,self).__init__()
+        self.conv1 = nn.Conv2d(2,1,7,padding=3,bias=False)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg_out = torch.mean(x,dim=1,keepdim=True)
+        max_out = torch.max(x,dim=1,keepdim=True,out=None)[0]
+
+        x = torch.cat([avg_out,max_out],dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class Hybrid_Model(nn.Module):
+    def __init__(self, ):
+        super(Hybrid_Model, self).__init__()
+        self.model_resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        self.model_resnet.fc = nn.Identity()
+
+        self.clip_model, _ = clip.load("ViT-B/32", device='cuda')
+        self.clip_model.cuda().eval()
+
+        self.spec_fea_conv = nn.Conv2d(1024, 512, 3, stride=2, padding=1)
+        self.gene_fea_conv = nn.Conv2d(512, 256, 3, stride=2, padding=1)
+
+        self.channel_attention = ChannelAttention(512+256)
+        self.spatial_attention = SpatialAttention()
+
+        self.maxpool = nn.MaxPool2d(4, 1)
+        self.avgpool = nn.AvgPool2d(4, 1)
+
+        self.fc1 = nn.Linear(256 + 512, 512)
+        self.fc2 = nn.Linear(512, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x,x_clip):
+        with torch.no_grad():
+            _, img_feas = self.clip_model.encode_image(x_clip) # img_feas shape is [b, 49, 512]
+        # swap channel 1 and 2
+        img_feas = img_feas.permute(0, 2, 1)
+        # reshape the sem_feas
+        img_feas = img_feas.reshape(img_feas.shape[0], 512, 7, 7).float()
+        general_features = self.gene_fea_conv(img_feas)
+
+        x = self.model_resnet.conv1(x)
+        x = self.model_resnet.bn1(x)
+        x = self.model_resnet.relu(x)
+        x = self.model_resnet.maxpool(x)
+        x = self.model_resnet.layer1(x)
+        x = self.model_resnet.layer2(x)
+        specific_features = self.model_resnet.layer3(x)  # shape is [b, 1024, 8, 8]
+        specific_features = self.spec_fea_conv(specific_features)
+
+        x = torch.cat((specific_features, general_features), 1)
+        x = self.channel_attention(x) * x
+        x = self.spatial_attention(x) * x
+
+        # maxpool and avgpool ,add
+        x = self.maxpool(x) + self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+        return x
+
+class Trainer(object):
+    def __init__(self, check_path, epochs):
+        self.checkname = check_path
+
+        m = Hybrid_Model()
+        self.model = m.cuda()
+
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.0001)
+        self.lr_schduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer,
+                                                                      T_max=50,
+                                                                      eta_min=0.001 / 50)
+
+        _, self.clip_preprocess = clip.load("ViT-B/32", device='cuda')
+        # self.bce_loss = nn.BCELoss()
+        # weighted loss, 0:1 = 1:15
+        self.bce_loss = nn.BCELoss()
+
+        self.train_binary_evaluator = Evaluator(2)
+        self.test_binary_evaluator = Evaluator(2)
+
+        self.best_pred_val = 0.0
+        self.best_pred_train = 0.0
+        self.device = torch.device("cuda:0")
+
+        self.epochs = epochs
+
+    def training(self, dataloader, epoch):
+        self.model.to(self.device)
+        self.model.train()
+        self.train_binary_evaluator.reset()
+        b_loss = 0
+        flag = 0
+        for obj, obj_arr, label in dataloader:
+
+            # convert ins_ to Image
+            obj_img_list = []
+
+            for arr in obj_arr:
+                arr = np.array(arr)
+                obj_img = Image.fromarray(arr)
+                obj_clip = self.clip_preprocess(obj_img)
+                obj_img_list.append(obj_clip)
+
+            clip_input = torch.tensor(np.stack(obj_img_list, axis=0)).cuda()
+
+            obj, label = obj.cuda(), label.cuda()
+            self.optimizer.zero_grad()
+            out = self.model(obj, clip_input)
+            loss = self.bce_loss(out, label)
+
+            b_loss += loss.item()
+
+            loss.backward()
+            self.optimizer.step()
+
+            flag += 1
+
+        # self.lr_schduler.step()
+
+        # print the loss
+        print("{}, b_loss: {}".format(epoch, format(b_loss / flag, '.4f')))
+
+        # if this is the last epoch, save the model
+        if epoch == self.epochs - 1:
+            state_path = os.path.join(self.checkname, 'last.pth')
+            torch.save(self.model.state_dict(), state_path)
+        elif epoch % 20 == 0:
+            state_path = os.path.join(self.checkname, 'epoch_{}.pth'.format(epoch))
+            torch.save(self.model.state_dict(), state_path)
+
+def train_(check_path=None,
+           train_b_path='building.txt',
+           train_nb_path = 'non_building.txt',
+           batch_size=32, epochs=500,
+           train_=True):
+
+    global num_aug_files
+    print('checkname is :', check_path)
+    trainer = Trainer(check_path, epochs)
+
+    b_dataset_path = train_b_path
+    nb_dataset_path = train_nb_path
+    print('load dataset path is : ',b_dataset_path)
+    print('load nb_dataset_path is : ',nb_dataset_path)
+    train_dataset = CDdataset.CDdataset(b_dataset_path=b_dataset_path, nb_dataset_path=nb_dataset_path)
+
+    dataloader = DataLoader(train_dataset,
+                            batch_size=batch_size,
+                            num_workers=0,
+                            drop_last=False,
+                            shuffle=True)
+
+    if train_:
+        for epoch in range(epochs):
+            trainer.training(dataloader, epoch)
+
+    # load model
+    trainer.model.load_state_dict(torch.load(os.path.join(trainer.checkname, 'last.pth')))
+    print(os.path.join(trainer.checkname, 'last.pth'))
+
+    # clear the gpu cache
+    torch.cuda.empty_cache()
+    # clear memory
+    del trainer
+    # reset the args
+    args = None
+
+if __name__ == '__main__':
+    train_(dataset_name='CH',
+           train_b_path='building.txt',
+           train_nb_path = 'none_building.txt',
+           batch_size=32,
+           epochs=500,
+           train_=True,
+           val_=False)
