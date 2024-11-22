@@ -1,0 +1,656 @@
+import os
+device = "cuda"
+
+import sys
+import cv2
+import torch
+import tqdm
+from CLIP import clip
+from PIL import Image
+import numpy as np
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+
+sys.path.append("..")
+# and segment the original masks into two new masks using the new mask
+def omit_objects(masks, ):
+    sorted_masks = sorted(masks, key=(lambda x: x['area']), reverse=True)
+    for target_mask in sorted_masks:
+        for mask in sorted_masks:
+            if mask['area'] == target_mask['area']:
+                continue
+            else:
+                overlaping_area = np.sum(mask['segmentation'] * target_mask['segmentation'])
+                source_area = np.sum(mask['segmentation'])
+                if overlaping_area / source_area > 0.8:
+                    sorted_masks[:] = [d for d in sorted_masks if d.get('area') != mask['area']]
+
+    return sorted_masks
+
+
+# and segment the original masks into two new masks using the new mask
+def segment_masks_into_non_overlapping(masks, ):
+    # sort masks by area
+    sorted_masks = sorted(masks, key=(lambda x: x['area']))
+    new_masks = []
+    new_masks.append(sorted_masks[0])
+
+    # for the remaining masks in sorted_masks
+    for mask in sorted_masks[1:]:
+        m = mask['segmentation']
+        # check if m overlaps with all masks in new_masks
+        overlap = False
+        # merge all masks in new_masks to form a new mask
+        big_mask = np.zeros(m.shape)
+        for new_mask in new_masks:
+            n = new_mask['segmentation']
+            if m is n:
+                continue
+            big_mask = np.logical_or(big_mask, n)
+
+        sum_inter = (np.sum(m * big_mask))
+        # if the two masks overlap
+        if sum_inter > 0.0:
+            overlap = True
+            # segment m and n into three new masks, and add them to new_masks
+            overlapping_mask = np.logical_and(m, big_mask)
+            m1 = np.logical_and(m, np.logical_not(overlapping_mask))
+            new_masks.append({'segmentation': m1, 'area': np.sum(m1)})
+        if not overlap:
+            new_masks.append(mask)
+
+    return new_masks
+
+
+# for each mask in masks, if it overlaps with any mask in new_masks, remove it from masks
+def if_overlap(masks):
+    for mask in masks:
+        m = mask['segmentation']
+        # check if m overlaps with all masks in new_masks
+        overlap = False
+        for target_mask in masks:
+            if m is target_mask['segmentation']:
+                continue
+            n = target_mask['segmentation']
+            sum_inter = (np.sum(m * n))
+            if sum_inter > 0.0:
+                print(sum_inter)
+
+
+def find_direction(building_mask):
+    # find if the building instance intersects with image boundary
+    if np.sum(building_mask[0, :]) > 0 or np.sum(building_mask[-1, :]) > 0 or np.sum(
+            building_mask[:, 0]) > 0 or np.sum(building_mask[:, -1]) > 0:
+        # print('building instance intersects with image boundary')
+        # save the intersection directions for later pasting the instances to the edge of the image
+        if np.sum(building_mask[0, :]) > 0:
+            top = True
+        else:
+            top = False
+        if np.sum(building_mask[-1, :]) > 0:
+            bottom = True
+        else:
+            bottom = False
+        if np.sum(building_mask[:, 0]) > 0:
+            left = True
+        else:
+            left = False
+        if np.sum(building_mask[:, -1]) > 0:
+            right = True
+        else:
+            right = False
+    else:
+        top = False
+        bottom = False
+        left = False
+        right = False
+
+    direction = ''
+    if [top, bottom, left, right].count(True) == 3:
+        if not top:
+            direction = 'triple'
+        elif not bottom:
+            direction = 'triple'
+        elif not left:
+            direction = 'triple'
+        else:
+            direction = 'triple'
+
+    if [top, bottom, left, right].count(True) == 2:
+        if top and left:
+            direction = 'top_left'
+        elif top and right:
+            direction = 'top_right'
+        elif bottom and left:
+            direction = 'bot_left'
+        else:
+            direction = 'bot_right'
+
+    if [top, bottom, left, right].count(True) == 1:
+        if top:
+            direction = 'top'
+        elif bottom:
+            direction = 'bot'
+        elif left:
+            direction = 'left'
+        else:
+            direction = 'right'
+
+    if [top, bottom, left, right].count(True) == 0:
+        direction = 'center'
+
+    return direction
+
+
+def point_coordi_transform(point, direction):
+    x, y = point[0], point[1]
+    if direction == 'top':
+        return x, y + 128
+    elif direction == 'bot':
+        return x, y - 128
+    elif direction == 'left':
+        return x + 128, y
+    elif direction == 'right':
+        return x - 128, y
+    elif direction == 'top_left':
+        return x + 256, y + 256
+    elif direction == 'top_right':
+        return x, y + 256
+    elif direction == 'bot_left':
+        return x + 256, y
+    else:
+        return x, y
+
+class B_Masks:
+    def __init__(self, img_path, building_ins_path, none_building_ins_path,
+                 cross_building_ins_path, cross_none_building_ins_path, infer_path):
+        self.img_path = img_path
+        self.building_ins_path = building_ins_path
+        self.none_building_ins_path = none_building_ins_path
+        self.cross_building_ins_path = cross_building_ins_path
+        self.cross_none_building_ins_path = cross_none_building_ins_path
+        self.infer_path = infer_path
+
+        self.ins_list = []
+        self.ins_dir_list = []
+        self.ins_loc_list = []
+        self.ins_img_list = []
+        self.similarity = None
+
+        self.building_ins_list = []
+        self.building_ins_loc_list = []
+        self.building_ins_img_list = []
+
+        self.none_building_ins_list = []
+        self.none_building_type_list = []
+
+        self.cross_img_ins_list = []
+        self.cross_img_building_ins_list = []
+        self.cross_img_ins_loc_list = []
+        self.cross_img_ins_img_list = []
+
+        # self.large_result = np.zeros((15104, 11264, 3), dtype=np.uint8)
+        self.large_result = None
+        self.large_result_2 = None
+        # get current path
+        self.current_path = os.path.dirname(os.path.abspath(__file__))
+        checkpoint_path = os.path.join(self.current_path, "sam_vit_h_4b8939.pth")
+        self.sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
+        self.sam.to(device="cuda")
+        self.predictor = SamPredictor(self.sam)
+
+        self.mask_generator = SamAutomaticMaskGenerator(
+            model=self.sam,
+            points_per_side=10,
+            points_per_batch=120,
+            pred_iou_thresh=0.95,
+            stability_score_thresh=0.95,
+            crop_nms_thresh=0.7,
+            box_nms_thresh=0.6,
+            crop_n_layers=1,
+            # crop_overlap_ratio = 10 / 1500,
+            crop_n_points_downscale_factor=2,
+            min_mask_region_area=200,  # Requires open-cv to run post-processing
+        )
+
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=device)
+        self.clip_model.cuda().eval()
+
+        str_ = ["building", "bareland", "vegetation", "road"]  # 9
+
+        # append each string with a prefix 'a remote sensing of'
+        for i in range(len(str_)):
+            str_[i] = 'an airborne image of ' + str_[i]
+
+        self.text = clip.tokenize(str_).to(device)
+        self.text_features = self.clip_model.encode_text(self.text).float()
+        # self.model = MyModel().cuda()
+        # ck_p = 'E:\\code\\segment-anything-main\\Unsupervised_building_extraction\\outputs\whu\\last.pth'
+        # self.model.load_state_dict(torch.load(ck_p))
+
+    def sam_seg(self, image):
+        try:
+            masks = self.mask_generator.generate(image)
+        except:
+            return None
+        masks = omit_objects(masks)
+        return masks
+
+    def get_aspect_ratio(self,m):
+        # get the min y and max y in row 0 where pixel value ==1
+        y = np.where(m[0, :] == 1)[0]
+        if y.__len__() == 0:
+            return 10
+        if y.__len__() == 1:
+            top_point = [0, y[0]]
+        else:
+            top_point = [0, int((y[-1] + y[0]) / 2)]
+        # get the min x and max x in col 0 where pixel value ==1
+        x = np.where(m[:, 0] == 1)[0]
+        if x.__len__() == 0:
+            return 10
+        if x.__len__() == 1:
+            left_point = [x[0], 0]
+        else:
+            left_point = [int((x[-1] + x[0]) / 2), 0]
+        # get the min y and max y in row -1 where pixel value ==1
+        y = np.where(m[-1, :] == 1)[0]
+        if y.__len__() == 0:
+            return 10
+        if y.__len__() == 1:
+            bot_point = [m.shape[0], y[0]]
+        else:
+            bot_point = [m.shape[0], int((y[-1] + y[0]) / 2)]
+        # get the min x and max x in col -1 where pixel value ==1
+        x = np.where(m[:, -1] == 1)[0]
+        if x.__len__() == 0:
+            return 10
+        if x.__len__() == 1:
+            right_point = [x[0], m.shape[1]]
+        else:
+            right_point = [int((x[-1] + x[0]) / 2), m.shape[1]]
+
+        # plot mask and the four point
+        # plt.imshow(m)
+        # plt.scatter(top_point[1], top_point[0], c='red', s=50)
+        # plt.scatter(bot_point[1], bot_point[0], c='green', s=50)
+        # plt.scatter(left_point[1], left_point[0], c='blue', s=50)
+        # plt.scatter(right_point[1], right_point[0], c='grey', s=50)
+        # plt.show()
+
+        cnt = np.array([top_point, bot_point, left_point, right_point])
+        rect = cv2.minAreaRect(cnt)
+        width = rect[1][0]
+        height = rect[1][1]
+
+        aspect_ratio = max(height, width) / min(height, width)
+        return aspect_ratio
+
+    def find_upscale_images(self, img_name, input_point):
+        img_h_index, img_w_index = img_name.split('.')[0].split('_')[0], img_name.split('.')[0].split('_')[1]
+        # top_left image name
+        top_left_img_name = str(int(img_h_index) - 1) + '_' + str(int(img_w_index) - 1) + '.png'
+        # top image name
+        top_img_name = str(int(img_h_index) - 1) + '_' + img_w_index + '.png'
+        # top_right image name
+        top_right_img_name = str(int(img_h_index) - 1) + '_' + str(int(img_w_index) + 1) + '.png'
+        # left image name
+        left_img_name = img_h_index + '_' + str(int(img_w_index) - 1) + '.png'
+        # right image name
+        right_img_name = img_h_index + '_' + str(int(img_w_index) + 1) + '.png'
+        # bot_left image name
+        bot_left_img_name = str(int(img_h_index) + 1) + '_' + str(int(img_w_index) - 1) + '.png'
+        # bot image name
+        bot_img_name = str(int(img_h_index) + 1) + '_' + img_w_index + '.png'
+        # bot_right image name
+        bot_right_img_name = str(int(img_h_index) + 1) + '_' + str(int(img_w_index) + 1) + '.png'
+
+        # if any of the above images does not exist, return None
+        if not os.path.exists(os.path.join(self.img_path, top_left_img_name)) or not os.path.exists(
+                os.path.join(self.img_path, top_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, top_right_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, left_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, right_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, bot_left_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, bot_img_name)) or not os.path.exists(
+            os.path.join(self.img_path, bot_right_img_name)):
+            return None, None
+
+        # stitch the images together
+        top_left_img = np.array(Image.open(os.path.join(self.img_path, top_left_img_name)))
+        top_img = np.array(Image.open(os.path.join(self.img_path, top_img_name)))
+        top_right_img = np.array(Image.open(os.path.join(self.img_path, top_right_img_name)))
+        left_img = np.array(Image.open(os.path.join(self.img_path, left_img_name)))
+        right_img = np.array(Image.open(os.path.join(self.img_path, right_img_name)))
+        bot_left_img = np.array(Image.open(os.path.join(self.img_path, bot_left_img_name)))
+        bot_img = np.array(Image.open(os.path.join(self.img_path, bot_img_name)))
+        bot_right_img = np.array(Image.open(os.path.join(self.img_path, bot_right_img_name)))
+        center_img = np.array(Image.open(os.path.join(self.img_path, img_name)))
+
+        top_row = np.concatenate((top_left_img, top_img, top_right_img), axis=1)
+        middle_row = np.concatenate((left_img, center_img, right_img), axis=1)
+        bottom_row = np.concatenate((bot_left_img, bot_img, bot_right_img), axis=1)
+        new_img = np.concatenate((top_row, middle_row, bottom_row), axis=0)
+
+        # update image point
+        x, y = input_point[0], input_point[1]
+        new_input_point = [x + 256, y + 256]
+
+        return new_img, new_input_point
+
+    def go(self, ):
+        img_list = os.listdir(self.img_path)
+        sorted(img_list)
+        list_length = len(img_list)
+        print('length of img_list:', list_length)
+
+        num_img_row = []
+        num_img_col = []
+        for img_name in img_list:
+            img_row_num = img_name.split('.')[0].split('_')[0]
+            img_col_num = img_name.split('.')[0].split('_')[1]
+            num_img_row.append(int(img_row_num))
+            num_img_col.append(int(img_col_num))
+
+        # find the largest row and col num
+        max_row_num = max(num_img_row)
+        max_col_num = max(num_img_col)
+
+        self.large_result = np.zeros(((max_row_num + 1) * 256, (max_col_num + 1) * 256), dtype=np.uint8)
+        self.large_result_2 = np.zeros(((max_row_num + 1) * 256, (max_col_num + 1) * 256), dtype=np.uint8)
+
+        print('-----------start to save the building instances---------')
+        outer = tqdm.tqdm(total=len(img_list), desc='Length', position=0)
+        for img_name in img_list:
+            self.img_segmentation(img_name, max_row_num, max_col_num)
+            outer.update(1)
+
+        print('-----------start to classify the instances---------')
+        self.similarity = self.clip_predict(self.ins_list)
+
+        print('-----------start to iterate the instances---------')
+        self.classify_instances_2()
+        # self.classify_instances()
+
+        for i in range(self.building_ins_list.__len__()):
+            # add the ins mask onto the large label
+            m = np.array(self.building_ins_list[i])[:, :, 0]
+            m[m > 0] = 1
+            m = np.uint8(m * 255)
+            x, y, _, _ = self.building_ins_loc_list[i]
+            img_name = self.building_ins_img_list[i]
+            self.add_ins_to_large_label(m, x, y, img_name)
+
+        print('-----------start to save the instances---------')
+        self.save_ins()
+
+        print('-----------find building ins in the cross instances---------')
+        print('length of self.cross_img_ins_list:', self.cross_img_ins_list.__len__())
+
+        cross_building_ins_list, cross_none_building_ins_list = self.find_cross_building_ins(self.cross_img_ins_list)
+
+        for i in range(cross_none_building_ins_list.__len__()):
+            ins = cross_none_building_ins_list[i]
+            if ins is not None:
+                ins.save(os.path.join(self.cross_none_building_ins_path, str(i) + '.png'))
+
+        for i in range(cross_building_ins_list.__len__()):
+            ins = cross_building_ins_list[i]
+            if ins is not None:
+                ins.save(os.path.join(self.cross_building_ins_path, str(i) + '.png'))
+
+                # add the ins mask onto the large label
+                m = np.array(ins)[:, :, 0]
+                m[m > 0] = 1
+                m = np.uint8(m * 255)
+                x, y, _, _ = self.cross_img_ins_loc_list[i]
+                img_name = self.cross_img_ins_img_list[i]
+                self.add_ins_to_large_label(m, x, y, img_name)
+
+        # save the large label
+        large_label = Image.fromarray(self.large_result)
+        large_label.save(os.path.join(self.infer_path, 'pseudo_label.png'))
+
+    def add_ins_to_large_label(self, m, x, y, img_name):
+        img_h_index, img_w_index = img_name.split('.')[0].split('_')[0], img_name.split('.')[0].split('_')[1]
+        row = int(img_h_index) * 256 + y
+        col = int(img_w_index) * 256 + x
+        height, width = m.shape[0], m.shape[1]
+        self.large_result[row:row + height, col:col + width] = np.maximum(self.large_result[row:row + height, col:col + width], m)
+
+    def add_ins_to_large_label_2(self, m, x, y, img_name):
+        img_h_index, img_w_index = img_name.split('.')[0].split('_')[0], img_name.split('.')[0].split('_')[1]
+        row = int(img_h_index) * 256 + y
+        col = int(img_w_index) * 256 + x
+        height, width = m.shape[0], m.shape[1]
+        # for pixels in self.large_result_2[row:row + height, col:col + width], add the value in m into it
+        self.large_result_2[row:row + height, col:col + width] = np.maximum(self.large_result_2[row:row + height, col:col + width], m)
+
+    def classify_instances_2(self, ):
+        for i in range(self.ins_list.__len__()):
+            ins = self.ins_list[i]
+            direction = self.ins_dir_list[i]
+            loc = self.ins_loc_list[i]
+            img_name = self.ins_img_list[i]
+            simi_ = self.similarity[i, :]
+
+            x, y, width, height = loc[0], loc[1], loc[2], loc[3]
+            input_point = np.array([x + width // 2, y + height // 2])
+
+            m = np.array(ins)[:, :, 0]
+            m[m > 0] = 1
+
+            aspect_ratio = self.get_aspect_ratio(m)
+
+            largest = max(simi_)
+            index = simi_.tolist().index(largest)
+
+            if direction == 'center':
+                if index == 0 or index == 1:
+                    if np.sum(m) > 1000 and aspect_ratio < 6:
+                        self.building_ins_list.append(ins)
+                        self.building_ins_loc_list.append([x, y, width, height])
+                        self.building_ins_img_list.append(img_name)
+                else:
+                    if np.sum(m) > 1000:
+                        self.none_building_ins_list.append(ins)
+                        self.none_building_type_list.append(index)
+            else:
+                img_h_index, img_w_index = img_name.split('.')[0].split('_')[0], \
+                img_name.split('.')[0].split('_')[1]
+                cp_row = int(img_h_index) * 256 + input_point[1]
+                cp_col = int(img_w_index) * 256 + input_point[0]
+                # if input_point not in self.large_result
+                if self.large_result_2[cp_row, cp_col] == 0:
+                    new_img_arr, new_input_point = self.find_upscale_images(img_name, input_point)
+                    if new_img_arr is None:
+                        continue
+                    ins, [x, y, width, height], start_point_img_name = self.get_cross_instance(img_name, new_img_arr, new_input_point)
+                    # add the ins mask onto the large label
+                    m = np.array(ins)[:, :, 0]
+                    m[m > 0] = 1
+                    # m = np.uint8(m * 255)
+                    self.add_ins_to_large_label_2(m, x, y, start_point_img_name)
+
+    def img_segmentation(self, img_name, max_row_num, max_col_num):
+        img_p = os.path.join(self.img_path, img_name)
+
+        img_arr = np.array(Image.open(img_p))
+        img_masks = self.sam_seg(img_arr)
+        if img_masks is None:
+            print('do nothing due to unknown error in SAM')
+            return
+
+        img_masks = sorted(img_masks, key=(lambda x: x['area']))
+        ins_list, ins_dir_list, ins_loc_list, ins_img_list = self.get_masked_instance(img_name, img_arr, img_masks)
+
+        self.ins_list.extend(ins_list)
+        self.ins_dir_list.extend(ins_dir_list)
+        self.ins_loc_list.extend(ins_loc_list)
+        self.ins_img_list.extend(ins_img_list)
+
+    def get_cross_instance(self, img_name, img_arr, point):
+        self.predictor.set_image(img_arr)
+        input_point = np.array([point])
+        input_label = np.ones(input_point.shape[0])
+
+        new_mask, score, logit = self.predictor.predict(
+            point_coords=input_point,
+            point_labels=input_label,
+            multimask_output=False,
+        )
+
+        # segment the new_mask into two new masks
+        new_mask = new_mask[0]
+        new_mask[new_mask == True] = 1
+        new_mask[new_mask == False] = 0
+        # extend the mask to 3 channels
+        new_mask = np.stack([new_mask, new_mask, new_mask], axis=2)
+        new_mask_gray = np.uint8(new_mask * 255)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(new_mask_gray[:, :, 0],
+                                                                        connectivity=8)
+        stats = stats[stats[:,4].argsort()][::-1]
+        bbox = stats[1]
+        x, y, width, height = bbox[0], bbox[1], bbox[2], bbox[3]
+        bbox[3] = bbox[3] + bbox[1]
+        bbox[2] = bbox[2] + bbox[0]
+
+        # clip img with bbox
+        clip_img = img_arr[bbox[1]:bbox[3], bbox[0]:bbox[2], :]
+        clip_ins_mask = new_mask[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+        ins = clip_img * clip_ins_mask
+        ins = Image.fromarray(ins)
+
+        self.cross_img_ins_list.append(ins)
+        self.cross_img_ins_loc_list.append([x, y, width, height])
+        start_point_img_name = str(int(img_name.split('.')[0].split('_')[0])-1) + '_' + str(
+            int(img_name.split('.')[0].split('_')[1])-1) + '.png'
+        self.cross_img_ins_img_list.append(start_point_img_name)
+
+        return ins, [x, y, width, height], start_point_img_name
+
+    def find_cross_building_ins(self, ins_list):
+        simi = self.clip_predict(ins_list)
+        building_lins_list = []
+        none_building_ins_list = []
+        for i in range(ins_list.__len__()):
+            simi_ = simi[i]
+            largest = max(simi_)
+            index = simi_.tolist().index(largest)
+
+            m = np.array(ins_list[i])[:, :, 0]
+            m[m > 0] = 1
+            aspect_ratio = self.get_aspect_ratio(m)
+
+            if index == 0 or index == 1:
+                if np.sum(np.array(ins_list[i])[:, :, 0]) > 1000 and aspect_ratio < 6:
+                    building_lins_list.append(ins_list[i])
+                else:
+                    building_lins_list.append(None)
+            else:
+                building_lins_list.append(None)
+                if np.sum(np.array(ins_list[i])[:, :, 0]) > 1000:
+                    none_building_ins_list.append(ins_list[i])
+
+        return building_lins_list, none_building_ins_list
+
+    def get_masked_instance(self, img_name, img_arr, img_masks):
+        ins_list = []
+        ins_dir_list = []
+        ins_loc_list = []
+        ins_img_list = []
+
+        for mask in img_masks:
+            if mask['area'] < 2000:
+                continue
+            m = mask['segmentation']
+            m[m == True] = 1
+            m[m == False] = 0
+            m_gray = np.uint8(m * 255)
+
+            direction = find_direction(m)
+            if direction == '':
+                continue
+
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(m_gray, connectivity=8)
+            bbox = stats[1][:4]
+            x, y, width, height = bbox[0], bbox[1], bbox[2], bbox[3]
+
+            bbox[3] = bbox[3] + bbox[1]
+            bbox[2] = bbox[2] + bbox[0]
+
+            # clip img with bbox
+            clip_img = img_arr[bbox[1]:bbox[3], bbox[0]:bbox[2], :]
+            clip_ins_mask = m[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            clip_ins_mask_ = np.stack([clip_ins_mask, clip_ins_mask, clip_ins_mask], axis=2)
+            ins = clip_img * clip_ins_mask_
+            ins = Image.fromarray(ins)
+
+            ins_list.append(ins)
+            ins_dir_list.append(direction)
+            ins_loc_list.append([x, y, width, height])
+            ins_img_list.append(img_name)
+
+        return ins_list, ins_dir_list, ins_loc_list, ins_img_list
+
+    def clip_predict(self, ins_list):
+        images = []
+        for ins in ins_list:
+            images.append(self.clip_preprocess(ins))
+
+        # split images into batches with size of 32
+        if len(images) < 64:
+            batch_size = len(images)
+        else:
+            batch_size = 64
+
+        # build an empty array named with similarity with the shape of (len(images), 10)
+        row_num = len(images)
+        new_array = np.zeros((row_num, 4))
+
+        # new_arr = np.stack(images[:])
+        # print(new_arr.shape)
+
+        for i in range(len(images) // batch_size):
+            if i == len(images) // batch_size - 1:
+                image_input = torch.tensor(np.stack(images[i * batch_size:])).cuda()
+            else:
+                image_input = torch.tensor(np.stack(images[i * batch_size:(i + 1) * batch_size])).cuda()
+
+            with torch.no_grad():
+                image_features, _ = self.clip_model.encode_image(image_input)
+
+            text_features = self.text_features
+            image_features = image_features.float()
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            similarity_ = image_features.cpu().detach().numpy() @ text_features.cpu().detach().numpy().T
+
+            if i == len(images) // batch_size - 1:
+                new_array[i * batch_size:] = similarity_
+            else:
+                new_array[i * batch_size:(i + 1) * batch_size] = similarity_
+
+        # print(new_array.shape)
+        return new_array
+
+    def save_ins(self, ):
+        for i in range(self.building_ins_list.__len__()):
+            ins = self.building_ins_list[i]
+            ins.save(os.path.join(self.building_ins_path, str(i) + '.png'))
+
+        for i in range(self.none_building_ins_list.__len__()):
+            ins = self.none_building_ins_list[i]
+            t = self.none_building_type_list[i]
+            ins.save(os.path.join(self.none_building_ins_path, str(i) + '.png'))
+        return
+
+def prepare_path(path):
+    if os.path.exists(path):
+        for file in os.listdir(path):
+            os.remove(os.path.join(path, file))
+        os.rmdir(path)
+        os.mkdir(path)
+    else:
+        os.mkdir(path)
+
